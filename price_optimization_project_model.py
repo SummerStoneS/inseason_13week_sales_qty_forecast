@@ -1,9 +1,7 @@
 import os
 from glob import glob
-import pandas as pd
 import datetime
 import json
-import numpy as np
 from scipy.optimize import curve_fit
 from config import *
 from curve_functions import *
@@ -23,8 +21,9 @@ class PathManager:
 		if not os.path.exists(os.path.join(self.base_url, path)):
 			os.makedirs(os.path.join(self.base_url, path))
 
+
 class DataRefactor:
-	
+
 	def __init__(self):
 		self.input_data = None
 		self.col_dict = {
@@ -35,7 +34,7 @@ class DataRefactor:
 		"MSRP":['CHN_LATEST_MSRP'],
 		"classification":["SILH_DESC"]
 		}
-	
+
 	def load_data(self,data,use_cols=None):
 		self.input_data = data
 		if use_cols:
@@ -113,8 +112,7 @@ def process_traffic_data(traffic_raw):
 	# weekly traffic(daily average in a week) by sub_platform from elaine
 	traffic_raw.rename(columns={"platform":"sub_platform"}, inplace=True)
 	traffic_raw["platform"] = np.where(traffic_raw.sub_platform.isin(['SNKRS APP','Nike.com','GROUP PURCHASE']),
-									   "NIKE.COM",
-									   np.where(traffic_raw.sub_platform.isin(['Tmall', 'TMALL Jordan', 'TMALL YA']),"TMALL",None))
+									   "NIKE.COM", np.where(traffic_raw.sub_platform.isin(['Tmall', 'TMALL Jordan', 'TMALL YA']),"TMALL",None))
 	traffic = traffic_raw[traffic_raw["platform"].notnull()]
 	traffic_grouped = traffic.groupby(["platform","week_end"]).sum().reset_index()
 	return traffic_grouped
@@ -123,9 +121,31 @@ def extract_style_cd(df):
 	return df.apply(lambda x: x[:-4])
 
 
+def get_comp_models_ready(target_season):
+	"""
+	for model level forecasting
+	:param target_season: forecast season
+	:return: target season models and corresponding style codes, along with last year same season comp models and their styles
+	"""
+	def refine_format(comp_data):
+		comp_data["season_cd"] = comp_data["season_cd"].replace({6001: "SP", 6002: "SU", 6003: "FA", 6004: "HO"})
+		comp_data["target_season"] = comp_data.apply(lambda x: f"{x['season_cd']}{x['year']}", axis=1)
+		comp_data = comp_data.query("target_season == @target_season")
+		comp_data.rename(columns={'comp_style_code': "style_cd", "style_code":"style_cd"}, inplace=True)
+		comp_data["style_cd"] = comp_data["style_cd"].astype(str)
+		return comp_data[['model', 'style_cd','pos_begin_date', 'pos_end_date']]
+	# prepare style codes in comp models as in train season
+	comp_data_src = pd.read_excel(f"{paths.source}/{comp_model_file}", sheet_name="IS COMP MODEL LIST")
+	comp_model = refine_format(comp_data_src)
+	# prepare style codes in target models as in forecast season
+	target_model_src = pd.read_excel(f"{paths.source}/{comp_model_file}", sheet_name="IS FUTURE MODEL")
+	target_model = refine_format(target_model_src)
+	return target_model, comp_model
+
+
 def prepare_data_master(runtime=2):
 	if runtime != 1:
-		data_master5 = pd.read_csv(f"{paths.step_data}/data_master2020303.csv")
+		data_master6 = pd.read_csv(f"{paths.step_data}/{data_master_file}",parse_dates=["week_begin", "week_end"])
 	else:
 		# load raw data from sql server
 		sold = pd.read_csv(f"{paths.source}/DIG_TMALL_NIKECOM_WEEKLY_SOLD_SU18_to_HO19.csv")
@@ -191,16 +211,29 @@ def prepare_data_master(runtime=2):
 
 		# merge yearweek number
 		calendar = pd.read_excel(f"{paths.source}/calendar_date_weekno.xlsx")
-		data_master5["week_begin"] = pd.to_datetime(data_master5["week_begin"])
 		calendar.rename(columns={"DATE":"week_begin"},inplace=True)
-		data_master5 = left_join_with_check(data_master5, calendar[["week_begin", "YrWkNum"]], {"on": "week_begin"})
-		data_master5.to_csv(f"{paths.step_data}/data_master2020303.csv", index=False)
-	return data_master5
+		calendar["week_begin"] = pd.to_datetime(calendar["week_begin"])
+		data_master6 = left_join_with_check(data_master5, calendar[["week_begin", "YrWkNum"]], {"on": "week_begin"})
+		data_master6.to_csv(f"{paths.step_data}/{data_master_file}", index=False)
+
+	return data_master6
+
+
+def get_style_traffic():
+	style_traffic = pd.read_csv(f"{paths.source}/{traffic_style}")
+	style_traffic["week_end"] = pd.to_datetime(style_traffic["week_end"])
+	style_traffic["avg_daily_pdp_traffic"] = style_traffic["avg_daily_pdp_traffic"] * 7
+	style_traffic["avg_daily_pv"] = style_traffic["avg_daily_pv"] * 7
+	style_traffic.rename(columns={"styl_cd": "style_cd",
+								  "avg_daily_pdp_traffic": "style_traffic_week",
+								  "avg_daily_pv": "style_pv_week"}, inplace=True)
+	del style_traffic['YrWkNo']
+	return style_traffic
 
 
 ########################################  run inseason forecast model (adapt paper theory)     ######################################
 
-def process_train_and_test_dataset(data_master5, train_season, target_season, run_time=2):
+def process_train_and_test_dataset(data_master5, train_season, target_season, run_time=2, method="style_level_same_code"):
 	"""
 		Step 1. Data extraction
 				** Data truncate for modeling
@@ -219,7 +252,7 @@ def process_train_and_test_dataset(data_master5, train_season, target_season, ru
 
 		if it's the first time of running code, run_time should be set to 1
 
-	"""	
+	"""
 	def get_buy_plan_data(train_season):
 		if run_time == 1:
 			# use buy plan qty as q0(from Mya)
@@ -235,34 +268,14 @@ def process_train_and_test_dataset(data_master5, train_season, target_season, ru
 			su18_buy_style = pd.read_excel(f"{paths.step_data}/{train_season}_buy_processed.xlsx", sheet_name="style_level")
 		return su18_buy_style
 
-	def get_style_traffic():
-		style_traffic = pd.read_csv(f"{paths.source}/{traffic_style}")
-		style_traffic["week_end"] = pd.to_datetime(style_traffic["week_end"])
-		style_traffic["avg_daily_pdp_traffic"] = style_traffic["avg_daily_pdp_traffic"] * 7
-		style_traffic["avg_daily_pv"] = style_traffic["avg_daily_pv"] * 7
-		style_traffic.rename(columns={"styl_cd": "style_cd",
-									  "avg_daily_pdp_traffic": "style_traffic_week",
-									  "avg_daily_pv": "style_pv_week"}, inplace=True)
-		del style_traffic['YrWkNo']
-		return style_traffic
-
 	def agg_sku_to_style(train_season):
 		# get su2018 inseason ftw data as train dataset, since we are modeling on style-level(model-level), we are going to aggregate sku
 		su18_inseason_ftw_sku = data_master5.query("(season1 == @train_season) & (inseason_flag1 == 'Y') & (PE == 'FTW')")
 		su18_inseason_ftw_sku["style_cd"] = extract_style_cd(su18_inseason_ftw_sku["prod_code"])
 		su18_inseason_ftw_sku["msrp_amt"] = su18_inseason_ftw_sku.eval("MSRP*sales_qty")
-		su18_inseason_ftw_style = su18_inseason_ftw_sku.groupby(["platform","style_cd","week_end","week_begin","YrWkNum"]).agg({
-			'sales_qty':sum, 
-			'sales_amt':sum,
-			"msrp_amt": sum,
-			'STYLCOLOR_DESC':'first',
-			'gender':'first',
-			'category':'first',
-			'PE':'first',
-			'MSRP':pd.Series.mode,
-			'Traffic':'mean',
-			'EOP_QTY': sum}).reset_index()
+		su18_inseason_ftw_style = su18_inseason_ftw_sku.groupby(["platform","style_cd","week_end","week_begin","YrWkNum"]).agg(agg_dict).reset_index()
 		return su18_inseason_ftw_style
+
 
 	def get_same_styles_codes_in_train_and_test():
 		# find 18 19 common style and attributes, then find common ftw key styles
@@ -271,64 +284,95 @@ def process_train_and_test_dataset(data_master5, train_season, target_season, ru
 		common_styles = su18_styles & su19_styles
 		return common_styles
 
-	def filter_inseason_transaction_period(model_master_final, season):
+
+	def filter_inseason_transaction_period(model_master_final, season, sort_keys=None):
+		sort_keys = sort_keys or ["style_cd","week_begin"]
 		model_master_final["week_begin"] = pd.to_datetime(model_master_final["week_begin"])
-		model_base = model_master_final[(model_master_final["week_begin"] >= pd.to_datetime(f"{season[2:]}-03-31")) &
-		(model_master_final["week_begin"] < pd.to_datetime(f"{season[2:]}-07-01")) & 
-		(model_master_final.sales_qty >= 0)].sort_values(by=["style_cd","week_begin"])
+		model_base = model_master_final[(model_master_final["week_begin"] >= pd.to_datetime(f"{season[2:]}-{season_periods_dict[season[:2]][0]}")) &
+		(model_master_final["week_begin"] < pd.to_datetime(f"{season[2:]}-{season_periods_dict[season[:2]][1]}")) &
+		(model_master_final.sales_qty >= 0)].sort_values(by=sort_keys)
 		return model_base
 
 
-	def finalize_train_dataset_features(model_base):
+	def finalize_train_dataset_features(model_base, key=None):
 		"""
 			Step 2 make features required in the function curve
 		"""
+		key = key or "style_cd"
 		model_base["avg_selling_price"] = model_base.eval("sales_amt/sales_qty")
 
-		group_index = ['platform', 'style_cd','STYLCOLOR_DESC','gender','category', 'PE', 'MSRP']
+		group_index = ['platform'] + [key] + ['STYLCOLOR_DESC','gender','category', 'PE', 'MSRP']
+
+		# calculate some season(13-week) statistics like start selling week and end selling week, median traffic, max inventory
 		season_stats = model_base.groupby(group_index).agg({
 			'YrWkNum': [min,max],
-			'Traffic': max,
+			'Traffic': 'median',
+			"style_traffic_week":'max',
 			'EOP_QTY': max
 			})
-		season_stats.columns=["sn_wk0","sn_wk_end", "sn_max_traffic","sn_max_inventory"]
+		season_stats.columns=["sn_wk0","sn_wk_end", "sn_median_traffic","sn_max_style_traffic", "sn_max_inventory"]
 		model_base = left_join_with_check(model_base,season_stats,{"left_on": group_index,"right_index": True})
 
 		model_base["MSRP"] = model_base["MSRP"].astype(float)
 		model_base["md"] = model_base.eval("avg_selling_price/MSRP")
-		model_base = model_base[~model_base["style_cd"].isin(model_base.query("md>1").style_cd.unique())]		# delete abnormal markdown style
+		# model_base = model_base[~model_base[key].isin(model_base.query("md>1")[key].unique())]		# delete abnormal markdown style
 		model_base["sales_wk"] = model_base.eval("YrWkNum - sn_wk0")
-		model_base["q0"] = model_base.eval("season_buy_qty / (sn_wk_end - sn_wk0)")
-		weekly_max = model_base.groupby(["platform", "style_cd"]).agg({"sales_qty":[max, 'median', 'mean']})
-		weekly_max.columns = ["max_wk_sold", "median_wk_sold", "avg_wk_sold"]	# theoretically q0 should not greater than max_wk_sold
+		model_base["q0"] = model_base.eval("season_buy_qty / (sn_wk_end - sn_wk0 + 1)")
+		weekly_max = model_base.groupby(["platform", key]).agg({"sales_qty":[max, 'median', 'mean', min]})
+		weekly_max.columns = ["max_wk_sold", "median_wk_sold", "avg_wk_sold", "min_wk_sold"]	# theoretically q0 should not greater than max_wk_sold
 		model_base = left_join_with_check(model_base, weekly_max,
-										  {"left_on": ["platform", "style_cd"], "right_index": True})
+										  {"left_on": ["platform", key], "right_index": True})
 		return model_base
 
-	def extract_train_and_test(season):
+
+	def extract_train_and_test(season, specified_style_df=None):
+		"""
+		:param season:
+		:param specified_style_df: comp styles or target styles DataFrame
+		:return:
+		"""
 		su18_buy_style = get_buy_plan_data(season)
 		su18_inseason_ftw_style = agg_sku_to_style(season)
-		common_styles = get_same_styles_codes_in_train_and_test()
-		su18_inseason_ftw_style["common_style_su19"] = su18_inseason_ftw_style["style_cd"].isin(common_styles)	# True if a style in su2018 also appears in su2019
-		# filter tmall and common styles shared with su2019
-		model_master = su18_inseason_ftw_style[(su18_inseason_ftw_style["common_style_su19"]>0) & (su18_inseason_ftw_style["platform"] == "TMALL")]
+		su18_inseason_ftw_style["week_end"] = pd.to_datetime(su18_inseason_ftw_style["week_end"])
+
+		if method == "model_level":
+			merge_comp_models = pd.merge(su18_inseason_ftw_style, specified_style_df, on="style_cd")
+			# for each comp style, pos_begin_date-pos_end_date is its validate time window, transactions should be within the period
+			model_master_style = merge_comp_models.query("(week_begin >= pos_begin_date) | (week_end <= pos_end_date)")
+		else:
+			common_styles = get_same_styles_codes_in_train_and_test()
+			su18_inseason_ftw_style["common_style_su19"] = su18_inseason_ftw_style["style_cd"].isin(common_styles)	# True if a style in su2018 also appears in su2019
+			# filter tmall and common styles shared with su2019
+			model_master_style = su18_inseason_ftw_style[(su18_inseason_ftw_style["common_style_su19"]>0)]
+
+		model_master_style = model_master_style.query("platform == 'TMALL'")
 		# merge tmall retail moment days
 		retail_moment_data = pd.read_csv(f"{paths.source}/{retail_moment_file_src}")
-		model_master = left_join_with_check(model_master, retail_moment_data, {"on":["platform", "YrWkNum"]})
+		model_master_style = left_join_with_check(model_master_style, retail_moment_data, {"on":["platform", "YrWkNum"]})
 		# merge buy plan(noted: whole season buy qty merge with weekly sales data)
-		model_master_final = left_join_with_check(model_master, su18_buy_style, {"on":["platform", "style_cd"]})
+		model_master_style = left_join_with_check(model_master_style, su18_buy_style, {"on":["platform", "style_cd"]})
 		# merge style level traffic
 		style_traffic = get_style_traffic()
-		model_master_final["week_end"] = pd.to_datetime(model_master_final["week_end"])
-		model_master_final = left_join_with_check(model_master_final, style_traffic, {"on":["style_cd","week_end"]})
-		model_base = filter_inseason_transaction_period(model_master_final, season)
-		model_base = finalize_train_dataset_features(model_base)
-		model_base.to_excel(f"{paths.model_data}/model_master_{season}_by_style_same_code.xlsx",index=False)
+		model_master_style = left_join_with_check(model_master_style, style_traffic, {"on":["style_cd","week_end"]})
+		if method == "model_level":
+			model_master_final = model_master_style.groupby(["platform", "model", "week_begin", "week_end", "YrWkNum"]).agg(agg_model_dict).reset_index()
+			key = "model"
+		else:
+			model_master_final = model_master_style.copy()
+			key = "style_cd"
+		model_base = filter_inseason_transaction_period(model_master_final, season, sort_keys=[key,"week_begin"])
+		model_base = finalize_train_dataset_features(model_base, key)
+		model_base.to_excel(f"{paths.model_data}/model_master_{season}_by_{method}.xlsx",index=False)
 		return model_base
 
-	train_base = extract_train_and_test(train_season)
-	test_base = extract_train_and_test(target_season)
-	return train_base, test_base 
+	if method == "model_level":
+		target_models, comp_models = get_comp_models_ready(target_season)
+		train_base = extract_train_and_test(train_season, comp_models)
+		test_base = extract_train_and_test(target_season, target_models)
+	else:
+		train_base = extract_train_and_test(train_season)
+		test_base = extract_train_and_test(target_season)
+	return train_base, test_base
 
 """
 	Step 3. Modeling: curve fitting
@@ -336,6 +380,7 @@ def process_train_and_test_dataset(data_master5, train_season, target_season, ru
 			2. q0: 
 
 """
+
 def curve_function(x, s0, t0, lambda1, lambda2, gamma):
 	"""
 		!!!! no traffic version
@@ -353,7 +398,7 @@ def curve_function(x, s0, t0, lambda1, lambda2, gamma):
 			**gamma: price sensitivity
 			**cr: conversion rate of traffic
 	"""
-    
+
 	# traffic = x[0]
 	q0 = x[0]
 	sales_wk = x[1]
@@ -382,68 +427,86 @@ def get_params_init_and_boundarys(train_data):
 	return init_params, bounds
 
 
-def run_curve_fit(train_dataset, get_init_params=None, curve_func=None, use_x=None):
-	"""
-	:param train_dataset:
-	:param get_init_params: get initial guess and bounds for curve params
-	:param curve_func: use what curve function
-	:param use_x: features that in the curve as original input
-	:return: in sample forecast result and curve params for each style
-	"""
+class Weekly_Curve_Fit:
+	def __init__(self, model_base, test_data, y, x_cols, curve_func, init_func, model_name, method="same_code_style_level"):
+		self.model_base = model_base
+		self.test_data = test_data
+		self.y = y
+		self.x_cols = x_cols
+		self.curve_func = curve_func
+		self.init_func = init_func
+		self.model_name = model_name
+		self.method = method
+		self.key = "model" if method == 'model_level' else "style_cd"
 
-	get_init_params = get_init_params or get_params_init_and_boundarys
-	curve_func = curve_func or curve_function
-	use_x = use_x or ["q0", "sales_wk", "DaysRM", "md"]
+	def fit(self):
+		self.train_dataset = self.model_base.dropna(subset=self.x_cols + [self.y], axis=0)
+		self.train_dataset = self.train_dataset.query("(sn_wk_end - sn_wk0) >= 5")  # if total selling weeks in a season is fewer than 5 weeks, then kick out
+		self.in_sample_fcst_result, self.model_params = self.run_curve_fit()
 
-	in_sample_fcst_result = pd.DataFrame()
-	model_params = {}
-	styles_set = train_dataset["style_cd"].unique()
-	for style_code in styles_set:
-		train_data = train_dataset.query("style_cd == @style_code")
-		train_data["sales_wk"] += 1
-		xdata = train_data[use_x].values.T
-		ydata = train_data["sales_qty"].values
-		params_guess, params_bounds = get_init_params(train_data)
-		try:
-			popt, pcov = curve_fit(curve_func, xdata, ydata, p0 = params_guess, bounds = params_bounds)
-			predict_qty = pd.Series(curve_func(xdata, *popt),name="fcst_qty")
-			result_data = pd.concat([train_data.reset_index(drop=True),predict_qty],axis=1)
-			in_sample_fcst_result = in_sample_fcst_result.append(result_data,ignore_index=True)
-			model_params[style_code] = list(popt)
-		except:
-			print(style_code)
-			print(xdata)
-	return in_sample_fcst_result, model_params
+	def predict(self):
+		out_sample_fcst_result = pd.DataFrame()
+		for style_code in self.in_sample_fcst_result[self.key].unique():
+			curve_param = self.model_params[style_code]
+			predict_style_data = self.test_data[self.test_data[self.key] == style_code]
+			predict_style_data["sales_wk"] += 1
+			xdata = predict_style_data[self.x_cols].values.T
+			y_predict = pd.Series(self.curve_func(xdata, *curve_param), name="fcst_qty")
+			predict_style_data = pd.concat([predict_style_data.reset_index(drop=True), y_predict], axis=1)
+			out_sample_fcst_result = out_sample_fcst_result.append(predict_style_data, ignore_index=True)
+		self.out_sample_fcst_result = out_sample_fcst_result
 
+	def save_result(self):
+		paths.add_source(self.model_name, f"model_data/{self.method}/{self.model_name}")
+		self.in_sample_fcst_result.to_excel(f"{getattr(paths, self.model_name)}/fcst_result_insample_{train_season}_{self.model_name}.xlsx", index=False)
+		self.out_sample_fcst_result.to_excel(f"{getattr(paths, self.model_name)}/fcst_result_outsample_{target_season}_{self.model_name}.xlsx", index=False)
+		with open(f"{getattr(paths, self.model_name)}/model_params_{train_season}_{self.model_name}.json","w") as f:
+			json.dump(self.model_params,f)
+		return self.model_params
 
-def predict_target_season(fcst_result, test_data, params, curve_func=None, use_x=None):
-	curve_func = curve_func or curve_function
-	use_x = use_x or ["q0", "sales_wk", "DaysRM", "md"]
-	out_sample_fcst_result = pd.DataFrame()
-	for style_code in fcst_result["style_cd"].unique():
-		curve_param = params[style_code]
-		predict_style_data = test_data.query("style_cd == @style_code")
-		predict_style_data["sales_wk"] += 1
-		xdata = predict_style_data[use_x].values.T
-		y_predict = pd.Series(curve_func(xdata, *curve_param), name="fcst_qty")
-		predict_style_data = pd.concat([predict_style_data.reset_index(drop=True), y_predict], axis=1)
-		out_sample_fcst_result = out_sample_fcst_result.append(predict_style_data, ignore_index=True)
-	return out_sample_fcst_result
+	def performance(self):
+		filter_gender = self.out_sample_fcst_result[self.out_sample_fcst_result.gender.isin(["MEN","WOMEN"])]
+		error = abs(filter_gender["fcst_qty"] - filter_gender[self.y]) / filter_gender[self.y]
+		print(f"mape within 30% prct: {sum(error <= 0.3)/len(error)}")
 
+	def fit_and_predict(self):
+		self.fit()
+		self.predict()
+		self.save_result()
+		self.performance()
 
-def main(model_base, y, x_cols, curve_func, init_func, model_name):
+	def run_curve_fit(self):
+		"""
+		:param train_dataset:
+		:param get_init_params: get initial guess and bounds for curve params
+		:param curve_func: use what curve function
+		:param use_x: features that in the curve as original input
+		:return: in sample forecast result and curve params for each style
+		"""
 
-	train_dataset = model_base.dropna(subset = x_cols + [y], axis=0)
-	train_dataset = train_dataset.query("(sn_wk_end - sn_wk0) > 5")     # if total selling weeks in a season is fewer than 5 weeks, then kick out
-	in_sample_fcst_result, model_params = run_curve_fit(train_dataset, get_init_params=init_func,
-													curve_func=curve_func, use_x=x_cols)
-	out_sample_fcst_result = predict_target_season(in_sample_fcst_result, test_base, model_params,
-												   curve_func=curve_func, use_x=x_cols)
-	paths.add_source(model_name, f"model_data/{model_name}")
-	in_sample_fcst_result.to_excel(f"{getattr(paths, model_name)}/fcst_result_insample_{train_season}_{model_name}.xlsx", index=False)
-	out_sample_fcst_result.to_excel(f"{getattr(paths, model_name)}/fcst_result_outsample_{target_season}_{model_name}.xlsx", index=False)
-	with open(f"{getattr(paths, model_name)}/model_params_{train_season}_{model_name}.json","w") as f:
-		json.dump(model_params,f)
+		get_init_params = self.init_func or get_params_init_and_boundarys
+		curve_func = self.curve_func or curve_function
+		use_x = self.x_cols or ["q0", "sales_wk", "DaysRM", "md"]
+
+		in_sample_fcst_result = pd.DataFrame()
+		model_params = {}
+		styles_set = self.train_dataset[self.key].unique()
+		for style_code in styles_set:
+			train_data = self.train_dataset[self.train_dataset[self.key] == style_code]
+			train_data["sales_wk"] += 1
+			xdata = train_data[use_x].values.T
+			ydata = train_data["sales_qty"].values
+			params_guess, params_bounds = get_init_params(train_data)
+			try:
+				popt, pcov = curve_fit(curve_func, xdata, ydata, p0=params_guess, bounds=params_bounds)
+				predict_qty = pd.Series(curve_func(xdata, *popt), name="fcst_qty")
+				result_data = pd.concat([train_data.reset_index(drop=True), predict_qty], axis=1)
+				in_sample_fcst_result = in_sample_fcst_result.append(result_data, ignore_index=True)
+				model_params[style_code] = list(popt)
+			except:
+				print(style_code)
+				print(xdata)
+		return in_sample_fcst_result, model_params
 
 
 if __name__ == '__main__':
@@ -454,24 +517,97 @@ if __name__ == '__main__':
 	train_season = "SU2018"
 	target_season = 'SU2019'
 	paths.add_source("model_data", "model_data")
-	model_base, test_base = process_train_and_test_dataset(data_master, train_season, target_season, run_time=2)	# run_time set to 1 if first run buy plan data
-
 	y = "sales_qty"
 
-
+	#	---------	style-level same style code forecast use comp list from Grace	----------	##
+	model_base, test_base = process_train_and_test_dataset(data_master, train_season, target_season, run_time=2)	# run_time set to 1 if first run buy plan data
 	# linear md
 	linear_md_settings = {"x_cols": ["style_traffic_week", "median_wk_sold", "sales_wk", "DaysRM", "md"],
 						"curve_func": curve_function_linear_md, "init_func": get_init_and_bounds_linear_md,
 						"model_name":"linear_md"}
-	main(model_base, y, **linear_md_settings)
+	model = Weekly_Curve_Fit(model_base, test_base, y, **linear_md_settings)
+	model.fit_and_predict()
 
 	# linear md & site traffic
 	linear_md_site_traffic_settings = {"x_cols": ["Traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
 						"curve_func": curve_function_linear_md, "init_func": get_init_and_bounds_linear_md,
-						"model_name":"linear_md_site_traffic"}
-	main(model_base, y, **linear_md_site_traffic_settings)
+						"model_name":"linear_md_site_traffic2"}
+	model = Weekly_Curve_Fit(model_base, test_base, y, **linear_md_site_traffic_settings)
+	model.fit_and_predict()
 
-	# attempt to try other models
+	# linear md exp style traffic *****  45% women men within 30% mape
+	lin_md_exp_styl_traffic_settings = {"x_cols": ["style_traffic_week","sn_median_traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+						"curve_func": curve_function_lin_md_exp_traffic, "init_func": get_init_and_bounds_lin_md_exp_traffic,
+						"model_name":"lin_md_exp_styl_traffic"}
+	model = Weekly_Curve_Fit(model_base, test_base, y, **lin_md_exp_styl_traffic_settings)
+	model.fit_and_predict()
+
+	# exp md exp style traffic 42.25% within 30% MAPE
+	exp_md_exp_styl_traffic_settings = {"x_cols": ["style_traffic_week","sn_median_traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+						"curve_func": curve_function_exp_md_exp_traffic, "init_func": get_init_and_bounds_exp_md_exp_traffic,
+						"model_name":"exp_md_exp_styl_traffic"}
+	model = Weekly_Curve_Fit(model_base, test_base, y, **exp_md_exp_styl_traffic_settings)
+	model.fit_and_predict()
+
+
+	##---------model level forecast use comp list from Grace----------##
+	# site traffic and linear markdown
+	train_base_model, test_base_model = process_train_and_test_dataset(data_master, train_season, target_season, run_time=2, method="model_level")
+	# linear md & linear log traffic
+	linear_md_site_traffic_by_model_settings = {"x_cols": ["Traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+											"curve_func": curve_function_linear_md,
+											"init_func": get_init_and_bounds_linear_md,
+											"model_name": "linear_md_site_traffic_by_model",
+											"method": "model_level"}
+	model = Weekly_Curve_Fit(train_base_model, test_base_model, y, **linear_md_site_traffic_by_model_settings)
+	model.fit_and_predict()
+
+	# lin md exp traffic
+	linear_md_exp_traffic_by_model_settings = {"x_cols": ["style_traffic_week", "sn_median_traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+												"curve_func": curve_function_lin_md_exp_traffic,
+												"init_func": get_init_and_bounds_lin_md_exp_traffic,
+												"model_name": "linear_md_exp_traffic_by_model",
+												"method": "model_level"}
+	model = Weekly_Curve_Fit(train_base_model, test_base_model, y, **linear_md_exp_traffic_by_model_settings)
+	model.fit_and_predict()
+
+	# exp md exp traffic *****  49.18% within 30% MAPE
+	exp_md_exp_site_traffic_by_model_settings = {
+		"x_cols": ["style_traffic_week", "sn_median_traffic", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+		"curve_func": curve_function_exp_md_exp_traffic,
+		"init_func": get_init_and_bounds_exp_md_exp_traffic,
+		"model_name": "exp_md_exp_style_traffic_by_model","method": "model_level"}
+	model = Weekly_Curve_Fit(train_base_model, test_base_model, y, **exp_md_exp_site_traffic_by_model_settings)
+	model.fit_and_predict()
+
+
+	# # style traffic and linear markdown median sold as q0
+	# linear_md_style_traffic_by_model_settings = {"x_cols": ["style_traffic_week", "avg_wk_sold", "sales_wk", "DaysRM", "md"],
+	# 											"curve_func": curve_function_linear_md,
+	# 											"init_func": get_init_and_bounds_linear_md,
+	# 											"model_name": "linear_md_style_traffic_by_model",
+	# 											"method": "model_level"}
+	# main(train_base_model, test_base_model, y, **linear_md_style_traffic_by_model_settings)
+	#
+	# # style traffic and linear markdown avg sold as q0
+	# avg_sold_linear_md_style_traffic_by_model_settings = {"x_cols": ["style_traffic_week", "avg_wk_sold", "sales_wk", "DaysRM", "md"],
+	# 											"curve_func": curve_function_linear_md,
+	# 											"init_func": get_init_and_bounds_linear_md,
+	# 											"model_name": "avg_sold_lin_md_style_traffic_by_model",
+	# 											"method": "model_level"}
+	# main(train_base_model, test_base_model, y, **avg_sold_linear_md_style_traffic_by_model_settings)
+
+
+	# # power markdown style traffic median sold
+	# power_md_site_traffic_by_model_settings = {"x_cols": ["style_traffic_week", "median_wk_sold", "sales_wk", "DaysRM", "md"],
+	# 											"curve_func": curve_function_traffic,
+	# 											"init_func": get_init_and_bounds_traffic,
+	# 											"model_name": "power_md_site_traffic_by_model",
+	# 											"key": "model"}
+	# main(train_base_model, test_base_model, y, **power_md_site_traffic_by_model_settings)
+	#
+	#
+	# # attempt to try other models
 	# # style traffic, buy plan q0
 	# traffic_settings = {"x_cols": ["style_traffic_week", "q0", "sales_wk", "DaysRM", "md"],
 	# 					"curve_func": curve_function_traffic, "init_func": get_init_and_bounds_traffic,
