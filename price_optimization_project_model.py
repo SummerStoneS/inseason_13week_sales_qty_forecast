@@ -1,26 +1,13 @@
-import os
+#@Time    :3/10/2020
+#@Author  : Ruofei
+
+
 from glob import glob
 import datetime
 import json
 from scipy.optimize import curve_fit
 from config import *
 from curve_functions import *
-
-path_dict = {"source":"source_data","inseason_analysis":"inseason_analysis"}
-
-class PathManager:
-	def __init__(self, base_url,path_dict):
-		self.base_url = base_url
-		for name, value in path_dict.items():
-			setattr(self, name, os.path.join(self.base_url, value))
-			if not os.path.exists(os.path.join(self.base_url, value)):
-				os.makedirs(os.path.join(self.base_url, value))
-
-	def add_source(self,name,path):
-		setattr(self,name,os.path.join(self.base_url, path))
-		if not os.path.exists(os.path.join(self.base_url, path)):
-			os.makedirs(os.path.join(self.base_url, path))
-
 
 class DataRefactor:
 
@@ -511,8 +498,6 @@ class Weekly_Curve_Fit:
 
 if __name__ == '__main__':
 
-	paths = PathManager("", path_dict)
-	paths.add_source("step_data", "step_data")
 	data_master = prepare_data_master(runtime=2)
 	train_season = "SU2018"
 	target_season = 'SU2019'

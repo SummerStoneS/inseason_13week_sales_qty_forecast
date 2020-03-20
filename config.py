@@ -1,11 +1,16 @@
+#@Time    :2/28/2020
+#@Author  : Ruofei
+
 import pandas as pd
+import os
 # save_file
 
 data_master_file = "data_master2020310.csv"     # sku level sales qty & attributes & site traffic & booking, this is the basic data for modeling
-
+daily_sold_data = 'prophet_source_data.xlsx'    # daily sold data for common sku in su2018 and su2019
 # source
 retail_moment_file_src = "20200302_Dig_RetailMoment_Days_SP18_HO19_v1.0.csv"        # Elaine根据traffic整理出来的retail moment days
 rm_days_advanced_file_src = "20200302_Dig_RetailMoment_Days_SP18_HO19_ComImported_MoreDaysAdded_v2.0.csv"       # 基于上一版和nd的promotion calendar修改，加上了更多小节日，可能并没有反映在traffic上
+rm_daily_file_src = "20200316_Dig_Daily_RetailMoment_Calendar_SP18_HO19_v1.0.xlsx"
 
 traffic_platform = "20200228_Traffic_by_SubPlatform_Week_v1.0.csv"
 traffic_style = "20200305_Tmall_StyleLevel_Traffic_by_Week_v1.0.csv"
@@ -43,7 +48,13 @@ final_dataset_have_cols = ['platform', 'style_cd', 'week_end', 'week_begin', 'Yr
                            'sn_wk_end', 'sn_max_traffic', 'sn_max_inventory', 'md', 'sales_wk',
                            'q0', 'max_wk_sold', 'median_wk_sold', 'avg_wk_sold']
 
-season_periods_dict = {"SP":("01-01","03-31"), "SU":("03-31","07-01"), "FA":("07-01","10-01"), "HO":("10-01", "12-31")}
+season_periods_dict = {"SP": ("01-01","03-31"),
+                       "SU": ("03-31","07-01"),
+                       "FA": ("07-01","10-01"),
+                       "HO": ("10-01", "12-31"),
+                       "Jan": ("01-01", "02-01"),
+                       "Feb": ("02-01", "03-01"),
+                       "Mar": ("03-01", "04-01")}
 
 agg_dict = {
     'sales_qty':sum,
@@ -73,3 +84,20 @@ agg_model_dict = {
     'season_buy_qty': sum,
     'style_traffic_week': sum,
     'style_pv_week': sum}
+
+path_dict = {"source":"source_data","inseason_analysis":"inseason_analysis"}
+class PathManager:
+	def __init__(self, base_url,path_dict):
+		self.base_url = base_url
+		for name, value in path_dict.items():
+			setattr(self, name, os.path.join(self.base_url, value))
+			if not os.path.exists(os.path.join(self.base_url, value)):
+				os.makedirs(os.path.join(self.base_url, value))
+
+	def add_source(self,name,path):
+		setattr(self,name,os.path.join(self.base_url, path))
+		if not os.path.exists(os.path.join(self.base_url, path)):
+			os.makedirs(os.path.join(self.base_url, path))
+paths = PathManager("", path_dict)
+paths.add_source("step_data", "step_data")
+

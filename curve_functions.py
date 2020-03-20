@@ -1,3 +1,6 @@
+#@Time    :3/4/2020
+#@Author  : Ruofei
+
 import numpy as np
 
 def curve_function_traffic(x, s0, t0, lambda1, lambda2, gamma, cr):
